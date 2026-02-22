@@ -3,73 +3,281 @@
 import { useState, useMemo, lazy, Suspense } from "react";
 import SearchBar from "./searchbar";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { useToast } from "@/components/ui/use-toast";
 
 const MonacoEditor = lazy(() => import("@monaco-editor/react").then((m) => ({ default: m.default })));
 
+type OutputFormat = "text" | "markdown" | "raw" | "json";
+
 function stripHTML(html: string): string {
-  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function htmlToMarkdown(html: string): string {
+  let md = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "");
+  md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n# $1\n");
+  md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n## $1\n");
+  md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n### $1\n");
+  md = md.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, "\n#### $1\n");
+  md = md.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, "\n##### $1\n");
+  md = md.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, "\n###### $1\n");
+  md = md.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**");
+  md = md.replace(/<b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**");
+  md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
+  md = md.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
+  md = md.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
+  md = md.replace(/<img[^>]*src=["']([^"']+)["'][^>]*alt=["']([^"']*)["'][^>]*\/?>/gi, "![$2]($1)");
+  md = md.replace(/<img[^>]*src=["']([^"']+)["'][^>]*\/?>/gi, "![]($1)");
+  md = md.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, "- $1\n");
+  md = md.replace(/<br\s*\/?>/gi, "\n");
+  md = md.replace(/<\/p>/gi, "\n\n");
+  md = md.replace(/<hr[^>]*\/?>/gi, "\n---\n");
+  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+  md = md.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, "\n```\n$1\n```\n");
+  md = md.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi, "> $1\n");
+  md = md.replace(/<[^>]+>/g, "");
+  md = md.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#39;/gi, "'");
+  md = md.replace(/\n{3,}/g, "\n\n").trim();
+  return md;
+}
+
+function extractStructured(html: string, url: string): object {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() || "";
+  const metaDesc = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["']/i)?.[1] || "";
+  const h1s = [...(html.matchAll(/<h1[^>]*>([\s\S]*?)<\/h1>/gi) || [])].map((m) => m[1].replace(/<[^>]+>/g, "").trim());
+  const h2s = [...(html.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi) || [])].map((m) => m[1].replace(/<[^>]+>/g, "").trim());
+  const links = [...(html.matchAll(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi) || [])].map((m) => ({ href: m[1], text: m[2].replace(/<[^>]+>/g, "").trim() })).filter((l) => l.href.startsWith("http"));
+  const images = [...(html.matchAll(/<img[^>]*src=["']([^"']+)["'][^>]*>/gi) || [])].map((m) => m[1]);
+  const text = stripHTML(html);
+  return { url, title, metaDescription: metaDesc, headings: { h1: h1s, h2: h2s }, links: links.slice(0, 100), images: images.slice(0, 50), wordCount: text.split(/\s+/).filter(Boolean).length, textPreview: text.slice(0, 500) };
+}
+
+function downloadBlob(content: string, filename: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export default function Translator() {
   const [data, setData] = useState<any[] | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
-  const [rightFormat, setRightFormat] = useState<"text" | "markdown">("text");
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("text");
+  const [copied, setCopied] = useState(false);
+  const { toast } = useToast();
 
   const pages = (data || []).filter((p: any) => p?.url);
   const current = pages[selectedIdx];
 
-  const rightContent = useMemo(() => {
+  const converted = useMemo(() => {
     if (!current?.content) return "";
-    return rightFormat === "text" ? stripHTML(current.content) : current.content;
-  }, [current, rightFormat]);
+    switch (outputFormat) {
+      case "text": return stripHTML(current.content);
+      case "markdown": return htmlToMarkdown(current.content);
+      case "json": return JSON.stringify(extractStructured(current.content, current.url), null, 2);
+      case "raw": return current.content;
+    }
+  }, [current, outputFormat]);
 
-  const wordCount = rightContent.split(/\s+/).filter(Boolean).length;
-  const charCount = rightContent.length;
+  const text = useMemo(() => current?.content ? stripHTML(current.content) : "", [current]);
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const charCount = text.length;
   const readingTime = Math.ceil(wordCount / 200);
+  const contentSize = current?.content ? new Blob([current.content]).size : 0;
 
-  const download = (content: string, ext: string) => {
-    const blob = new Blob([content], { type: "text/plain" });
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `content.${ext}`; a.click();
+  const editorLang: Record<OutputFormat, string> = { text: "plaintext", markdown: "markdown", json: "json", raw: "html" };
+
+  const copyContent = () => {
+    navigator.clipboard.writeText(converted).then(() => {
+      setCopied(true);
+      toast({ title: "Copied to clipboard" });
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const downloadCurrent = () => {
+    const exts: Record<OutputFormat, string> = { text: "txt", markdown: "md", json: "json", raw: "html" };
+    const slug = current.url.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
+    downloadBlob(converted, `${slug}.${exts[outputFormat]}`, "text/plain");
+  };
+
+  const downloadAll = () => {
+    const ts = new Date().toISOString().slice(0, 10);
+    const allConverted = pages.map((p: any) => {
+      switch (outputFormat) {
+        case "text": return `## ${p.url}\n\n${stripHTML(p.content || "")}\n\n---\n`;
+        case "markdown": return `## ${p.url}\n\n${htmlToMarkdown(p.content || "")}\n\n---\n`;
+        case "json": return JSON.stringify(extractStructured(p.content || "", p.url));
+        case "raw": return `<!-- ${p.url} -->\n${p.content || ""}\n`;
+      }
+    });
+    const ext = outputFormat === "json" ? "json" : outputFormat === "markdown" ? "md" : outputFormat === "raw" ? "html" : "txt";
+    const content = outputFormat === "json" ? `[\n${allConverted.join(",\n")}\n]` : allConverted.join("\n\n");
+    downloadBlob(content, `translated-${ts}.${ext}`, "text/plain");
+  };
+
+  const getTitle = (html: string, url: string): string => {
+    const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return match?.[1]?.trim() || new URL(url).pathname;
   };
 
   return (
     <div className="flex flex-col h-screen">
       <SearchBar setDataValues={setData} />
       {pages.length > 0 && current ? (
-        <div className="flex flex-col flex-1 overflow-hidden">
-          <div className="flex items-center gap-3 px-4 py-2 border-b">
-            {pages.length > 1 && (
-              <select className="bg-background border rounded px-2 py-1 text-sm flex-1" value={selectedIdx} onChange={(e) => setSelectedIdx(Number(e.target.value))}>
-                {pages.map((p: any, i: number) => <option key={i} value={i}>{p.url}</option>)}
-              </select>
-            )}
-            <div className="flex gap-2">
-              <Button size="sm" variant={rightFormat === "text" ? "default" : "outline"} onClick={() => setRightFormat("text")}>Text</Button>
-              <Button size="sm" variant={rightFormat === "markdown" ? "default" : "outline"} onClick={() => setRightFormat("markdown")}>Raw</Button>
+        <div className="flex flex-1 overflow-hidden">
+          {/* Page List Sidebar */}
+          <div className="w-64 border-r flex flex-col shrink-0">
+            <div className="px-3 py-2 bg-muted/50 border-b text-xs font-medium text-muted-foreground flex items-center justify-between">
+              <span>{pages.length} page{pages.length !== 1 ? "s" : ""} crawled</span>
+              <Button size="sm" variant="ghost" className="h-6 px-2 text-[10px]" onClick={downloadAll}>
+                Export All
+              </Button>
             </div>
-            <div className="flex gap-3 text-xs text-muted-foreground">
-              <span>{wordCount} words</span>
-              <span>{charCount} chars</span>
-              <span>{readingTime} min read</span>
+            <div className="overflow-auto flex-1">
+              {pages.map((p: any, i: number) => {
+                const title = getTitle(p.content || "", p.url);
+                const size = new Blob([p.content || ""]).size;
+                const words = stripHTML(p.content || "").split(/\s+/).filter(Boolean).length;
+                return (
+                  <button
+                    key={i}
+                    className={`w-full text-left px-3 py-2.5 border-b last:border-b-0 hover:bg-muted/30 transition-colors ${selectedIdx === i ? "bg-muted/50 border-l-2 border-l-[#3bde77]" : ""}`}
+                    onClick={() => setSelectedIdx(i)}
+                  >
+                    <p className="text-xs font-medium truncate">{title}</p>
+                    <p className="text-[10px] text-muted-foreground truncate font-mono mt-0.5">{p.url}</p>
+                    <div className="flex gap-2 mt-1">
+                      <Badge variant="outline" className="text-[9px] px-1 py-0">{formatSize(size)}</Badge>
+                      <Badge variant="outline" className="text-[9px] px-1 py-0">{words} words</Badge>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
-            <Button size="sm" variant="ghost" onClick={() => navigator.clipboard.writeText(rightContent)}>Copy</Button>
-            <Button size="sm" variant="ghost" onClick={() => download(rightContent, rightFormat === "text" ? "txt" : "html")}>Download</Button>
           </div>
-          <div className="flex flex-1 overflow-hidden">
-            <div className="flex-1 border-r">
-              <Suspense fallback={<div className="p-4 text-muted-foreground">Loading editor...</div>}>
-                <MonacoEditor height="100%" language="html" value={current.content || ""} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on" }} />
-              </Suspense>
+
+          {/* Main Content Area */}
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {/* Toolbar */}
+            <div className="flex items-center gap-2 px-4 py-2 border-b bg-muted/20 flex-wrap">
+              <div className="flex gap-1 p-0.5 bg-muted/50 rounded-lg">
+                {(["text", "markdown", "raw", "json"] as OutputFormat[]).map((fmt) => {
+                  const labels: Record<OutputFormat, string> = { text: "Text", markdown: "Markdown", raw: "HTML", json: "JSON" };
+                  return (
+                    <Button
+                      key={fmt}
+                      size="sm"
+                      variant={outputFormat === fmt ? "default" : "ghost"}
+                      onClick={() => setOutputFormat(fmt)}
+                      className={`text-xs h-7 px-3 rounded-md ${outputFormat === fmt ? "bg-[#3bde77] hover:bg-[#2bc866] text-black" : ""}`}
+                    >
+                      {labels[fmt]}
+                    </Button>
+                  );
+                })}
+              </div>
+
+              <div className="flex-1" />
+
+              <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                <span>{wordCount.toLocaleString()} words</span>
+                <span>{charCount.toLocaleString()} chars</span>
+                <span>{readingTime} min read</span>
+                <span>{formatSize(contentSize)}</span>
+              </div>
+
+              <Button size="sm" variant="outline" className="text-xs h-7" onClick={copyContent}>
+                {copied ? (
+                  <><svg className="w-3 h-3 mr-1 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>Copied</>
+                ) : (
+                  "Copy"
+                )}
+              </Button>
+              <Button size="sm" variant="outline" className="text-xs h-7" onClick={downloadCurrent}>
+                Download
+              </Button>
             </div>
-            <div className="flex-1">
-              <Suspense fallback={<div className="p-4 text-muted-foreground">Loading editor...</div>}>
-                <MonacoEditor height="100%" language={rightFormat === "text" ? "plaintext" : "html"} value={rightContent} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on" }} />
-              </Suspense>
+
+            {/* Split View: Source + Output */}
+            <div className="flex flex-1 overflow-hidden">
+              {/* Source HTML */}
+              <div className="flex-1 border-r flex flex-col">
+                <div className="px-3 py-1.5 bg-muted/30 border-b text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                  Source HTML
+                </div>
+                <div className="flex-1">
+                  <Suspense fallback={<div className="p-4 text-muted-foreground text-sm">Loading editor...</div>}>
+                    <MonacoEditor height="100%" language="html" value={current.content || ""} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on", fontSize: 12 }} />
+                  </Suspense>
+                </div>
+              </div>
+
+              {/* Converted Output */}
+              <div className="flex-1 flex flex-col">
+                <div className="px-3 py-1.5 bg-muted/30 border-b text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                  {outputFormat === "text" ? "Clean Text" : outputFormat === "markdown" ? "Markdown" : outputFormat === "json" ? "Structured JSON" : "Raw HTML"}
+                </div>
+                <div className="flex-1">
+                  <Suspense fallback={<div className="p-4 text-muted-foreground text-sm">Loading editor...</div>}>
+                    <MonacoEditor height="100%" language={editorLang[outputFormat]} value={converted} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on", fontSize: 12 }} />
+                  </Suspense>
+                </div>
+              </div>
             </div>
           </div>
         </div>
       ) : (
-        <div className="flex items-center justify-center flex-1 text-muted-foreground">Enter a URL to translate content between formats</div>
+        <div className="flex flex-col items-center justify-center flex-1 text-center space-y-4">
+          <svg
+            height={64}
+            width={64}
+            viewBox="0 0 36 34"
+            xmlns="http://www.w3.org/2000/svg"
+            className="fill-[#3bde77] opacity-30"
+          >
+            <path
+              fillRule="evenodd"
+              clipRule="evenodd"
+              d="M9.13883 7.06589V0.164429L13.0938 0.164429V6.175L14.5178 7.4346C15.577 6.68656 16.7337 6.27495 17.945 6.27495C19.1731 6.27495 20.3451 6.69807 21.4163 7.46593L22.8757 6.175V0.164429L26.8307 0.164429V7.06589V7.95679L26.1634 8.54706L24.0775 10.3922C24.3436 10.8108 24.5958 11.2563 24.8327 11.7262L26.0467 11.4215L28.6971 8.08749L31.793 10.5487L28.7257 14.407L28.3089 14.9313L27.6592 15.0944L26.2418 15.4502C26.3124 15.7082 26.3793 15.9701 26.4422 16.2355L28.653 16.6566L29.092 16.7402L29.4524 17.0045L35.3849 21.355L33.0461 24.5444L27.474 20.4581L27.0719 20.3816C27.1214 21.0613 27.147 21.7543 27.147 22.4577C27.147 22.5398 27.1466 22.6214 27.1459 22.7024L29.5889 23.7911L30.3219 24.1177L30.62 24.8629L33.6873 32.5312L30.0152 34L27.246 27.0769L26.7298 26.8469C25.5612 32.2432 22.0701 33.8808 17.945 33.8808C13.8382 33.8808 10.3598 32.2577 9.17593 26.9185L8.82034 27.0769L6.05109 34L2.37897 32.5312L5.44629 24.8629L5.74435 24.1177L6.47743 23.7911L8.74487 22.7806C8.74366 22.6739 8.74305 22.5663 8.74305 22.4577C8.74305 21.7616 8.76804 21.0758 8.81654 20.4028L8.52606 20.4581L2.95395 24.5444L0.615112 21.355L6.54761 17.0045L6.908 16.7402L7.34701 16.6566L9.44264 16.2575C9.50917 15.9756 9.5801 15.6978 9.65528 15.4242L8.34123 15.0944L7.69155 14.9313L7.27471 14.407L4.20739 10.5487L7.30328 8.08749L9.95376 11.4215L11.0697 11.7016C11.3115 11.2239 11.5692 10.7716 11.8412 10.3473L9.80612 8.54706L9.13883 7.95679V7.06589Z"
+            />
+          </svg>
+          <h2 className="text-xl font-semibold text-muted-foreground">Spider Content Translator</h2>
+          <p className="text-sm text-muted-foreground max-w-md">
+            Crawl any website and convert its content between formats.
+            View source HTML side-by-side with clean text, markdown,
+            structured JSON, or raw HTML output.
+          </p>
+          <div className="flex gap-6 text-xs text-muted-foreground/60 pt-2">
+            <span>Clean Text</span>
+            <span>Markdown</span>
+            <span>Structured JSON</span>
+            <span>Raw HTML</span>
+          </div>
+        </div>
       )}
     </div>
   );
