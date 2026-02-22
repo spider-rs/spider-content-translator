@@ -1,14 +1,33 @@
 "use client";
 
-import { useState, useMemo, lazy, Suspense } from "react";
+import { useState, useMemo, useEffect, useRef, lazy, Suspense } from "react";
 import SearchBar from "./searchbar";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 const MonacoEditor = lazy(() => import("@monaco-editor/react").then((m) => ({ default: m.default })));
 
 type OutputFormat = "text" | "markdown" | "raw" | "json";
+type TargetLanguage = "en" | "es" | "fr" | "de" | "pt" | "it" | "ja" | "ko" | "zh-CN" | "ar" | "hi" | "ru";
+
+const LANGUAGES: { code: TargetLanguage; label: string }[] = [
+  { code: "en", label: "English (Original)" },
+  { code: "es", label: "Spanish" },
+  { code: "fr", label: "French" },
+  { code: "de", label: "German" },
+  { code: "pt", label: "Portuguese" },
+  { code: "it", label: "Italian" },
+  { code: "ja", label: "Japanese" },
+  { code: "ko", label: "Korean" },
+  { code: "zh-CN", label: "Chinese (Simplified)" },
+  { code: "ar", label: "Arabic" },
+  { code: "hi", label: "Hindi" },
+  { code: "ru", label: "Russian" },
+];
+
+const MYMEMORY_URL = "https://api.mymemory.translated.net/get";
 
 function stripHTML(html: string): string {
   return html
@@ -82,11 +101,78 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function quickHash(str: string): string {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36);
+}
+
+function splitIntoChunks(text: string, maxBytes = 450): string[] {
+  const chunks: string[] = [];
+  const paragraphs = text.split(/\n{2,}/);
+  let current = "";
+  for (const para of paragraphs) {
+    const combined = current ? current + "\n\n" + para : para;
+    if (new Blob([combined]).size > maxBytes && current) {
+      chunks.push(current);
+      current = para;
+    } else {
+      current = combined;
+    }
+  }
+  if (current) chunks.push(current);
+  // Split any single chunk still over limit by sentences
+  const result: string[] = [];
+  for (const chunk of chunks) {
+    if (new Blob([chunk]).size <= maxBytes) {
+      result.push(chunk);
+    } else {
+      const sentences = chunk.split(/(?<=[.!?])\s+/);
+      let buf = "";
+      for (const s of sentences) {
+        const next = buf ? buf + " " + s : s;
+        if (new Blob([next]).size > maxBytes && buf) {
+          result.push(buf);
+          buf = s;
+        } else {
+          buf = next;
+        }
+      }
+      if (buf) result.push(buf);
+    }
+  }
+  return result.length ? result : [""];
+}
+
+async function translateText(text: string, targetCode: string, signal?: AbortSignal): Promise<string> {
+  const chunks = splitIntoChunks(text);
+  const translated: string[] = [];
+  for (const chunk of chunks) {
+    const params = new URLSearchParams({ q: chunk, langpair: `en|${targetCode}` });
+    const res = await fetch(`${MYMEMORY_URL}?${params}`, { signal });
+    if (!res.ok) throw new Error(`Translation API error: ${res.status}`);
+    const json = await res.json();
+    if (json.responseStatus === 429 || json.responseStatus === 403) {
+      throw new Error("Translation quota exceeded — try again later");
+    }
+    translated.push(json.responseData?.translatedText || chunk);
+  }
+  return translated.join("\n\n");
+}
+
 export default function Translator() {
   const [data, setData] = useState<any[] | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("text");
   const [copied, setCopied] = useState(false);
+  const [targetLang, setTargetLang] = useState<TargetLanguage>("en");
+  const [translatedContent, setTranslatedContent] = useState("");
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translationError, setTranslationError] = useState<string | null>(null);
+  const translationCacheRef = useRef<Map<string, string>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
   const { toast } = useToast();
 
   const pages = (data || []).filter((p: any) => p?.url);
@@ -110,8 +196,69 @@ export default function Translator() {
 
   const editorLang: Record<OutputFormat, string> = { text: "plaintext", markdown: "markdown", json: "json", raw: "html" };
 
+  const isTranslatable = targetLang !== "en" && (outputFormat === "text" || outputFormat === "markdown");
+
+  // Translation effect
+  useEffect(() => {
+    if (!isTranslatable || !converted) {
+      setTranslatedContent("");
+      setIsTranslating(false);
+      setTranslationError(null);
+      return;
+    }
+
+    const cacheKey = `${quickHash(converted)}_${targetLang}`;
+    const cached = translationCacheRef.current.get(cacheKey);
+    if (cached) {
+      setTranslatedContent(cached);
+      setIsTranslating(false);
+      setTranslationError(null);
+      return;
+    }
+
+    // Abort previous in-flight request
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setIsTranslating(true);
+    setTranslationError(null);
+
+    translateText(converted, targetLang, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) {
+          translationCacheRef.current.set(cacheKey, result);
+          setTranslatedContent(result);
+          setIsTranslating(false);
+        }
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setIsTranslating(false);
+        setTranslationError(err.message);
+        toast({ title: "Translation failed", description: err.message, variant: "destructive" });
+      });
+
+    return () => controller.abort();
+  }, [converted, targetLang, outputFormat, isTranslatable, toast]);
+
+  // Clear translation cache when data changes (new crawl)
+  useEffect(() => {
+    translationCacheRef.current.clear();
+    setTranslatedContent("");
+    setTranslationError(null);
+  }, [data]);
+
+  const displayContent = useMemo(() => {
+    if (!isTranslatable) return converted;
+    if (translatedContent) return translatedContent;
+    return converted; // fallback during loading or error
+  }, [converted, isTranslatable, translatedContent]);
+
+  const langLabel = LANGUAGES.find((l) => l.code === targetLang)?.label || "English";
+
   const copyContent = () => {
-    navigator.clipboard.writeText(converted).then(() => {
+    navigator.clipboard.writeText(displayContent).then(() => {
       setCopied(true);
       toast({ title: "Copied to clipboard" });
       setTimeout(() => setCopied(false), 2000);
@@ -121,7 +268,7 @@ export default function Translator() {
   const downloadCurrent = () => {
     const exts: Record<OutputFormat, string> = { text: "txt", markdown: "md", json: "json", raw: "html" };
     const slug = current.url.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
-    downloadBlob(converted, `${slug}.${exts[outputFormat]}`, "text/plain");
+    downloadBlob(displayContent, `${slug}.${exts[outputFormat]}`, "text/plain");
   };
 
   const downloadAll = () => {
@@ -201,6 +348,26 @@ export default function Translator() {
                 })}
               </div>
 
+              <Select value={targetLang} onValueChange={(v) => setTargetLang(v as TargetLanguage)}>
+                <SelectTrigger className="w-[180px] h-7 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {LANGUAGES.map((lang) => (
+                    <SelectItem key={lang.code} value={lang.code} className="text-xs">
+                      {lang.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              {isTranslating && (
+                <svg className="w-4 h-4 animate-spin text-[#3bde77]" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+              )}
+
               <div className="flex-1" />
 
               <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -238,12 +405,25 @@ export default function Translator() {
 
               {/* Converted Output */}
               <div className="flex-1 flex flex-col">
-                <div className="px-3 py-1.5 bg-muted/30 border-b text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                  {outputFormat === "text" ? "Clean Text" : outputFormat === "markdown" ? "Markdown" : outputFormat === "json" ? "Structured JSON" : "Raw HTML"}
+                <div className="px-3 py-1.5 bg-muted/30 border-b text-[10px] font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+                  <span>
+                    {outputFormat === "text" ? "Clean Text" : outputFormat === "markdown" ? "Markdown" : outputFormat === "json" ? "Structured JSON" : "Raw HTML"}
+                    {isTranslatable && ` → ${langLabel}`}
+                  </span>
+                  {isTranslating && (
+                    <Badge variant="outline" className="text-[9px] px-1.5 py-0 animate-pulse text-[#3bde77] border-[#3bde77]/40">
+                      Translating...
+                    </Badge>
+                  )}
+                  {translationError && (
+                    <Badge variant="outline" className="text-[9px] px-1.5 py-0 text-red-400 border-red-400/40">
+                      Error
+                    </Badge>
+                  )}
                 </div>
                 <div className="flex-1">
                   <Suspense fallback={<div className="p-4 text-muted-foreground text-sm">Loading editor...</div>}>
-                    <MonacoEditor height="100%" language={editorLang[outputFormat]} value={converted} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on", fontSize: 12 }} />
+                    <MonacoEditor height="100%" language={editorLang[outputFormat]} value={displayContent} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: false }, wordWrap: "on", fontSize: 12 }} />
                   </Suspense>
                 </div>
               </div>
@@ -268,14 +448,15 @@ export default function Translator() {
           <h2 className="text-xl font-semibold text-muted-foreground">Spider Content Translator</h2>
           <p className="text-sm text-muted-foreground max-w-md">
             Crawl any website and convert its content between formats.
-            View source HTML side-by-side with clean text, markdown,
-            structured JSON, or raw HTML output.
+            Translate into 12 languages. View source HTML side-by-side
+            with clean text, markdown, structured JSON, or raw HTML output.
           </p>
           <div className="flex gap-6 text-xs text-muted-foreground/60 pt-2">
             <span>Clean Text</span>
             <span>Markdown</span>
             <span>Structured JSON</span>
             <span>Raw HTML</span>
+            <span>12 Languages</span>
           </div>
         </div>
       )}
